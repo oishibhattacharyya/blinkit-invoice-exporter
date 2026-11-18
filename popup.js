@@ -3,9 +3,11 @@ const log = (m) => { $("log").textContent += m + "\n"; $("log").scrollTop = $("l
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = () => 400 + Math.random() * 300;
 const withTimeout = (p, ms, label) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timed out`)), ms))]);
-const PAGE_BASES = ["accounts", "account"];   // https://blinkit.com/accounts/orders/{cartId}/{orderId}
+const redact = (u) => { try { const x = new URL(u); return x.origin + x.pathname + (x.search ? "?" + [...x.searchParams.keys()].map((k) => k + "=…").join("&") : ""); } catch { return u; } };
+const PAGE_BASES = ["account"];   // https://blinkit.com/account/orders/{cartId}/{orderId}
 
 let orders = [], templates = [], goodBase = null, pendingT0 = 0, stopFlag = false, worker = null;
+let extraLog = [], capturing = false;   // browser-level events (navigations/downloads) seen while learning
 let capture = { headers: {}, log: [] };
 
 function parseOrders(raw) {
@@ -51,7 +53,28 @@ async function ensureWorker() {
   worker = { winId: w.id, tabId: w.tabs[0].id };
   return worker;
 }
-async function closeWorker() { if (worker) { try { await chrome.windows.remove(worker.winId); } catch {} worker = null; } }
+// Blinkit's "Download invoice" sometimes opens the PDF in a new tab. We only need the request it
+// made, so close any extra tab that opens from the worker window (after letting it register).
+chrome.tabs.onCreated.addListener((tab) => {
+  if (!worker || tab.id === worker.tabId) return;
+  if (tab.openerTabId === worker.tabId || tab.windowId === worker.winId) {
+    setTimeout(() => { chrome.tabs.remove(tab.id).catch(() => {}); }, 1500);
+  }
+});
+// Browser-level watching: catches invoices that open as a PDF in the same tab, or that download
+// directly, which in-page hooks can't see.
+const isOrderOrHome = (u) => /\/account\/orders\//.test(u) || u.replace(/\/$/, "") === "https://blinkit.com" || u === "about:blank";
+chrome.webNavigation.onBeforeNavigate.addListener((d) => {
+  if (!capturing || !worker || d.tabId !== worker.tabId || d.frameId !== 0 || isOrderOrHome(d.url)) return;
+  extraLog.push({ ts: Date.now(), url: d.url, method: "GET", nav: true, webnav: true });
+});
+chrome.downloads.onCreated.addListener((item) => {
+  if (!capturing) return;
+  extraLog.push({ ts: Date.now(), url: item.url, method: "GET", nav: true, download: true });
+  // we only wanted to learn the address; don't leave stray PDFs in your Downloads folder
+  chrome.downloads.cancel(item.id).catch(() => {}).finally(() => chrome.downloads.erase({ id: item.id }).catch(() => {}));
+});
+async function closeWorker() { capturing = false; if (worker) { try { await chrome.windows.remove(worker.winId); } catch {} worker = null; } }
 async function goto(url) {
   const w = await ensureWorker();
   await navigate(w.tabId, url); await sleep(2000);
@@ -129,35 +152,75 @@ function toTemplate(req, o) {
 }
 const fillStr = (s, o) => s.split("{orderId}").join(o.orderId).split("{cartId}").join(o.cartId);
 const fill = (t, o) => ({ url: fillStr(t.url, o), method: t.method, body: fillStr(t.body, o) });
-function pickRequest(t0) {
-  const c = capture.log.filter((e) => e.ts >= t0);
-  return c.find((e) => e.isPdf) || c.find((e) => e.pdfLink || e.jsonPdf) || c.find((e) => e.nav) || [...c].reverse().find((e) => /invoice/i.test(e.url)) || null;
+function pickRequest(t0, o) {
+  const c = [...capture.log, ...extraLog].filter((e) => e.ts >= t0 && !/X-Amz-Signature=/i.test(e.url)).sort((a, b) => a.ts - b.ts);
+  const hasId = (e) => (e.url + (e.body || "")).includes(o.orderId) || (e.url + (e.body || "")).includes(o.cartId);
+  const classes = [(e) => e.isPdf, (e) => e.pdfLink || e.jsonPdf, (e) => e.nav, (e) => /invoice/i.test(e.url)];
+  for (const f of classes) { const hit = c.filter(f).find(hasId); if (hit) return hit; }
+  for (const f of classes) { const m = c.filter(f); if (m.length) return m[0]; }
+  return null;
 }
-const fetchPdf = (tabId, t, o) => withTimeout(inTab(tabId, fetchInPage, [fill(t, o), capture.headers]), 60000, "download").catch((e) => ({ error: e.message }));
+async function fetchPdf(tabId, t, o) {
+  const req = fill(t, o);
+  const r = await withTimeout(inTab(tabId, fetchInPage, [req, capture.headers]), 60000, "download").catch((e) => ({ error: e.message }));
+  if (r.base64 || !/failed to fetch|networkerror|load failed/i.test(r.error || "")) return r;
+  // The page itself isn't allowed to read the file (cross-site). The extension is, so retry from here.
+  const r2 = await withTimeout(fetchInPage(req, capture.headers), 60000, "direct download").catch((e) => ({ error: e.message }));
+  return r2.base64 ? r2 : { ...r2, error: r2.error + " (also failed directly)" };
+}
 
 // Work out a template from what the page just did, and prove it by downloading this order's PDF.
 async function finishFromCapture(tabId, o, t0) {
+  // the click may have left this tab on a PDF page; go back to a normal Blinkit page so we can run code in it
+  await sleep(500); await navigate(tabId, "https://blinkit.com/"); await sleep(1500);
   await loadCapture();
-  const req = pickRequest(t0);
-  if (!req) { log("  Nothing invoice-like was requested after the click."); return { error: "no invoice request caught" }; }
+  const req = pickRequest(t0, o);
+  if (!req) {
+    const signed = [...capture.log, ...extraLog].some((e) => e.ts >= t0 && /X-Amz-Signature=/i.test(e.url));
+    log(signed ? "  Saw only the one-time S3 file link, not the Blinkit request that creates it (S3 links can't be reused). Use ‘Copy diagnostic info’."
+               : "  Nothing invoice-like was requested after the click.");
+    return { error: "no invoice request caught" };
+  }
+  log(`  Using: ${req.method} ${redact(req.url)} [${req.isPdf ? "PDF" : req.pdfLink || req.jsonPdf ? "JSON with PDF link" : req.download ? "download" : req.webnav ? "page navigation" : "page request"}]`);
   const t = toTemplate(req, o);
   if (!/\{(orderId|cartId)\}/.test(t.url + t.body)) { log("  The download doesn't contain the order ID, so it can't be repeated for other orders."); return { error: "request has no order id" }; }
   const r = await fetchPdf(tabId, t, o);
   if (!r.base64) { log("  Test download failed: " + r.error); return { error: r.error }; }
   return { template: t, r };
 }
+async function waitForSignal(since, ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (extraLog.some((x) => x.ts >= since)) return "navigation";
+    await loadCapture();
+    if (capture.log.some((e) => e.ts >= since && (e.isPdf || e.pdfLink || e.jsonPdf))) return "invoice request";
+    await sleep(400);
+  }
+  return null;
+}
 async function learn(o) {
+  capturing = true;
   for (const base of goodBase ? [goodBase] : PAGE_BASES) {
     const t0 = Date.now(); pendingT0 = t0;
-    log(`  Opening order ${o.orderId} (${base})…`);
+    log(`  Opening order ${o.orderId}…`);
     const tabId = await goto(`https://blinkit.com/${base}/orders/${o.cartId}/${o.orderId}`);
-    let res;
-    try { res = await withTimeout(inTab(tabId, clickInvoiceInPage, [[12, 4]]), 60000, "page click"); }
-    catch (e) { log(`  ${e.message}. Tab is at: ${await tabInfo(tabId)}`); continue; }
-    if (!res.names.length) { log(`  No “Download invoice” text found. Tab is at: ${await tabInfo(tabId)}`); continue; }
-    goodBase = base; log("  Clicked: " + res.names.join(" → "));
-    await sleep(2500);
-    return await finishFromCapture(tabId, o, t0);
+    log("  Page loaded. Looking for “Download invoice”…");
+    const tClick = Date.now();
+    // If the click navigates away, the click script never reports back — so also watch for the effect itself.
+    const clickP = inTab(tabId, clickInvoiceInPage, [[12, 4]]).then((r) => ({ names: r.names }), () => ({ names: [] }));
+    const first = await Promise.race([clickP, waitForSignal(tClick, 45000).then((sig) => ({ sig }))]);
+    let names = first.names || [];
+    if (first.sig) { names = ["(clicked)"]; log(`  Saw it: ${first.sig}.`); await sleep(2000); }
+    else if (!names.length) {
+      if (await waitForSignal(tClick, 3000)) names = ["(clicked)"];
+      else { log(`  No “Download invoice” text found. Tab is at: ${await tabInfo(tabId)}`); continue; }
+    }
+    goodBase = base; log("  Clicked: " + names.join(" → "));
+    await sleep(3500);
+    log("  Working out the download address…");
+    const out = await finishFromCapture(tabId, o, t0);
+    if (out.template) capturing = false;
+    return out;
   }
   return { error: "invoice button not found" };
 }
@@ -242,7 +305,7 @@ $("clearBtn").addEventListener("click", async () => { await chrome.storage.local
 $("diagBtn").addEventListener("click", async () => {
   await loadCapture();
   const red = (u) => { try { const x = new URL(u); return x.origin + x.pathname + (x.search ? "?" + [...x.searchParams.keys()].map((k) => k + "=…").join("&") : ""); } catch { return u; } };
-  const reqs = capture.log.map((e) => `${e.method} ${red(e.url)} ${e.isPdf ? "[PDF]" : ""}${e.pdfLink ? "[JSON→PDF link]" : ""}${e.jsonPdf ? "[JSON has PDF data]" : ""}${e.nav ? "[navigation]" : ""}${e.blobPdf ? "[in-page PDF]" : ""}`).join("\n");
+  const reqs = [...capture.log, ...extraLog].map((e) => `${e.method} ${red(e.url)} ${e.isPdf ? "[PDF]" : ""}${e.pdfLink ? "[JSON→PDF link]" : ""}${e.jsonPdf ? "[JSON has PDF data]" : ""}${e.nav ? "[navigation]" : ""}${e.blobPdf ? "[in-page PDF]" : ""}${e.webnav ? "[browser navigation]" : ""}${e.download ? "[browser download]" : ""}`).join("\n");
   const tpls = templates.map((t) => `${t.method} ${red(t.url)} body:${t.body ? "yes" : "no"}`).join("\n");
   await navigator.clipboard.writeText(`header names: ${Object.keys(capture.headers).join(", ")}\n\nlearned formats:\n${tpls || "(none)"}\n\nrecent requests:\n${reqs}\n\nlog:\n${$("log").textContent}`);
   log("Diagnostic info copied (no tokens or cookies included).");
