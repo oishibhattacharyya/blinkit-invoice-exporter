@@ -21,12 +21,18 @@
     if (typeof o === "object") for (const v of Object.values(o)) { const r = findPdfLink(v, d + 1); if (r) return r; }
     return "";
   };
+  const findB64 = (o, d = 0) => {
+    if (o == null || d > 6) return "";
+    if (typeof o === "string") return o.startsWith("JVBERi") ? "yes" : "";
+    if (typeof o === "object") for (const v of Object.values(o)) { const r = findB64(v, d + 1); if (r) return r; }
+    return "";
+  };
   const inspect = (base, ct, getJson) => {
     if (/pdf/i.test(ct)) return logReq({ ...base, isPdf: true });
     if (/json/i.test(ct)) {
       Promise.resolve().then(getJson).then((d) => {
-        const l = findPdfLink(d);
-        if (l) logReq({ ...base, pdfLink: l });
+        const l = findPdfLink(d), b = findB64(d);
+        if (l || b) logReq({ ...base, pdfLink: l || undefined, jsonPdf: !!b });
         else if (/invoice/i.test(base.url)) logReq(base);
       }).catch(() => {});
     } else if (/invoice/i.test(base.url)) logReq(base);

@@ -1,25 +1,41 @@
 {
   "manifest_version": 3,
   "name": "Blinkit Bulk Invoice Zipper",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Bulk-downloads your own Blinkit order invoices into a single ZIP, using your logged-in session.",
-  "permissions": ["storage", "activeTab", "scripting"],
-  "host_permissions": ["https://*.blinkit.com/*"],
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*.blinkit.com/*"
+  ],
   "content_scripts": [
     {
-      "matches": ["https://*.blinkit.com/*"],
-      "js": ["interceptor.js"],
+      "matches": [
+        "https://*.blinkit.com/*"
+      ],
+      "js": [
+        "interceptor.js"
+      ],
       "world": "MAIN",
       "run_at": "document_start"
     },
     {
-      "matches": ["https://*.blinkit.com/*"],
-      "js": ["relay.js"],
+      "matches": [
+        "https://*.blinkit.com/*"
+      ],
+      "js": [
+        "relay.js"
+      ],
       "run_at": "document_start"
     }
   ],
   "action": {
-    "default_popup": "popup.html",
     "default_title": "Blinkit Invoice Zipper"
+  },
+  "background": {
+    "service_worker": "background.js"
   }
 }

@@ -2,18 +2,19 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<title>Blinkit Bulk Invoice Zipper</title>
 <style>
-  body{width:400px;margin:0;padding:16px;font-family:-apple-system,"Segoe UI",Roboto,sans-serif;background:#0f172a;color:#f8fafc}
-  h2{margin:0 0 10px;font-size:16px;color:#facc15}
-  .card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:12px;margin-bottom:12px;font-size:12px}
+  body{max-width:560px;margin:0 auto;padding:24px 16px;font-family:-apple-system,"Segoe UI",Roboto,sans-serif;background:#0f172a;color:#f8fafc}
+  h2{margin:0 0 12px;font-size:18px;color:#facc15}
+  .card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:14px;margin-bottom:12px;font-size:13px}
   .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:600;font-size:11px}
   .ok{background:#065f46;color:#6ee7b7}.warn{background:#78350f;color:#fde68a}
   input[type=file]{width:100%;box-sizing:border-box;margin-top:6px;padding:6px;background:#0f172a;border:1px solid #475569;color:#f8fafc;border-radius:6px;font-size:12px}
   button{width:100%;padding:10px;border:none;border-radius:8px;background:#facc15;color:#0f172a;font-weight:700;cursor:pointer;font-size:13px;margin-top:8px}
-  button.secondary{background:#334155;color:#f8fafc;font-weight:500;font-size:12px;padding:6px}
+  button.secondary{background:#334155;color:#f8fafc;font-weight:500;font-size:12px;padding:7px}
   button:disabled{opacity:.45;cursor:not-allowed}
   progress{width:100%;height:10px;margin-top:8px}
-  #log{max-height:130px;overflow-y:auto;font-family:monospace;font-size:11px;color:#94a3b8;margin-top:8px;white-space:pre-wrap}
+  #log{max-height:240px;overflow-y:auto;font-family:monospace;font-size:11px;color:#94a3b8;margin:8px 0;white-space:pre-wrap;background:#0b1220;padding:8px;border-radius:6px}
   details{margin-top:8px;color:#94a3b8}
   .muted{color:#94a3b8}
 </style>
@@ -22,9 +23,9 @@
 <h2>Blinkit Bulk Invoice Zipper</h2>
 
 <div class="card">
-  <b>Before you start:</b> make sure you're logged in to Blinkit in this browser.
-  <div style="margin-top:8px">Login captured: <span id="authStatus" class="badge warn">Not yet</span></div>
-  <div style="margin-top:6px">Invoice link found: <span id="endpointStatus" class="badge warn">Not yet</span></div>
+  <b>Before you start:</b> be logged in to Blinkit in this browser. During the run a separate Blinkit window will open — <b>leave it alone</b> until it closes itself.
+  <div style="margin-top:8px">Login captured: <span id="authStatus" class="badge warn">Not yet</span>
+  &nbsp; Invoice link found: <span id="endpointStatus" class="badge warn">Not yet</span></div>
 </div>
 
 <div class="card">
@@ -34,21 +35,23 @@
 </div>
 
 <div class="card">
-  <b>Step 2.</b> Let the extension figure out how invoices are downloaded
-  <div class="muted" style="margin:4px 0">It opens your first order in a background tab and clicks “Invoice” for you.</div>
+  <b>Step 2.</b> Let the extension learn how invoices are downloaded
+  <div class="muted" style="margin:4px 0">It opens your first order and clicks “Download invoice” for you.</div>
   <button id="detectBtn" disabled>Find invoice link automatically</button>
-  <button id="recheckBtn" class="secondary" style="display:none">I clicked Invoice myself — check again</button>
-  <details><summary>Technical details</summary><div id="tplView" style="word-break:break-all;margin-top:4px">–</div></details>
+  <button id="recheckBtn" class="secondary" style="display:none">I clicked “Download invoice” myself — check again</button>
+  <details><summary>Technical details</summary><div id="tplView" style="word-break:break-all;margin-top:4px;white-space:pre-wrap">–</div></details>
 </div>
 
 <div class="card">
   <b>Step 3.</b> Download everything
+  <div class="muted" style="margin:4px 0">If Blinkit's invoice format changes partway (older vs newer orders), it re-learns automatically.</div>
   <button id="startBtn" disabled>Download &amp; Zip All Invoices</button>
+  <button id="stopBtn" class="secondary" style="display:none">Stop now and save what I have so far</button>
   <progress id="progressBar" value="0" max="100" style="display:none"></progress>
 </div>
 
 <div id="log"></div>
-<button id="diagBtn" class="secondary">Copy diagnostic info (to share if something fails)</button>
+<button id="diagBtn" class="secondary">Copy diagnostic info (share this if something fails)</button>
 <button id="clearBtn" class="secondary">Clear saved login data</button>
 
 <script src="jszip.min.js"></script>
