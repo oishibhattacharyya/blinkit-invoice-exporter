@@ -1,63 +1,88 @@
-// Runs in the page (MAIN world). Observes fetch/XHR to learn auth headers and the invoice URL.
-// Sends findings to relay.js via postMessage; nothing is written to the page's localStorage.
+// Runs in the page (MAIN world). Watches Blinkit's own network calls so the extension can
+// learn (a) your session headers and (b) which request produces the invoice PDF.
 (() => {
   const TAG = "__bk_exporter__";
-  const isBlinkit = (u) => {
-    try { return new URL(u, location.href).hostname.endsWith("blinkit.com"); }
-    catch { return false; }
-  };
-  const abs = (u) => { try { return new URL(u, location.href).href; } catch { return u; } };
+  const isBlinkit = (u) => { try { return new URL(u, location.href).hostname.endsWith("blinkit.com"); } catch { return false; } };
+  const abs = (u) => { try { return new URL(u, location.href).href; } catch { return String(u); } };
   const send = (patch) => window.postMessage({ [TAG]: true, patch }, location.origin);
+  const logReq = (entry) => send({ log: { ts: Date.now(), ...entry } });
 
   const AUTH_RE = /auth|token|access|session|device|app_client|app_version|lat|lon|web_app/i;
   const pickAuth = (h) => {
     const out = {};
     if (!h) return out;
-    const entries = h instanceof Headers ? [...h.entries()]
-      : Array.isArray(h) ? h : Object.entries(h);
+    const entries = h instanceof Headers ? [...h.entries()] : Array.isArray(h) ? h : Object.entries(h);
     for (const [k, v] of entries) if (AUTH_RE.test(k)) out[k] = v;
     return out;
   };
+  const findPdfLink = (o, d = 0) => {
+    if (o == null || d > 6) return "";
+    if (typeof o === "string") return /^https?:\/\/\S+/i.test(o) && /(\.pdf|invoice)/i.test(o) ? o : "";
+    if (typeof o === "object") for (const v of Object.values(o)) { const r = findPdfLink(v, d + 1); if (r) return r; }
+    return "";
+  };
+  const inspect = (base, ct, getJson) => {
+    if (/pdf/i.test(ct)) return logReq({ ...base, isPdf: true });
+    if (/json/i.test(ct)) {
+      Promise.resolve().then(getJson).then((d) => {
+        const l = findPdfLink(d);
+        if (l) logReq({ ...base, pdfLink: l });
+        else if (/invoice/i.test(base.url)) logReq(base);
+      }).catch(() => {});
+    } else if (/invoice/i.test(base.url)) logReq(base);
+  };
 
+  // fetch
   const origFetch = window.fetch;
   window.fetch = async function (...args) {
     const [resource, config] = args;
-    const rawUrl = typeof resource === "string" ? resource : resource?.url || String(resource);
-    const mine = isBlinkit(rawUrl);
+    const raw = typeof resource === "string" ? resource : resource?.url || String(resource);
+    const mine = isBlinkit(raw);
+    let base = null;
     if (mine) {
-      const hdrs = { ...pickAuth(resource?.headers), ...pickAuth(config?.headers) };
-      if (Object.keys(hdrs).length) send({ headers: hdrs });
-      if (/invoice/i.test(rawUrl)) send({ invoiceUrlSample: abs(rawUrl) });
+      const h = { ...pickAuth(resource?.headers), ...pickAuth(config?.headers) };
+      if (Object.keys(h).length) send({ headers: h });
+      base = {
+        url: abs(raw),
+        method: (config?.method || resource?.method || "GET").toUpperCase(),
+        body: typeof config?.body === "string" ? config.body : ""
+      };
     }
     const res = await origFetch.apply(this, args);
-    if (mine && /invoice/i.test(rawUrl)) {
-      const ct = res.headers.get("content-type") || "";
-      if (ct.includes("json")) {
-        res.clone().json().then((d) => send({ invoiceJsonSample: JSON.stringify(d).slice(0, 2000) })).catch(() => {});
-      }
-    }
+    if (mine) inspect(base, res.headers.get("content-type") || "", () => res.clone().json());
     return res;
   };
 
-  const oOpen = XMLHttpRequest.prototype.open;
-  const oSet = XMLHttpRequest.prototype.setRequestHeader;
-  XMLHttpRequest.prototype.open = function (m, url, ...rest) {
-    this.__u = url;
-    if (isBlinkit(url) && /invoice/i.test(String(url))) send({ invoiceUrlSample: abs(url) });
-    return oOpen.call(this, m, url, ...rest);
-  };
+  // XHR
+  const oOpen = XMLHttpRequest.prototype.open, oSet = XMLHttpRequest.prototype.setRequestHeader, oSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (m, url, ...rest) { this.__m = String(m).toUpperCase(); this.__u = url; return oOpen.call(this, m, url, ...rest); };
   XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
-    if (this.__u && isBlinkit(this.__u)) {
-      const h = pickAuth({ [k]: v });
-      if (Object.keys(h).length) send({ headers: h });
-    }
+    if (this.__u && isBlinkit(this.__u)) { const h = pickAuth({ [k]: v }); if (Object.keys(h).length) send({ headers: h }); }
     return oSet.call(this, k, v);
   };
+  XMLHttpRequest.prototype.send = function (body) {
+    if (this.__u && isBlinkit(this.__u)) {
+      const base = { url: abs(this.__u), method: this.__m || "GET", body: typeof body === "string" ? body : "" };
+      this.addEventListener("load", () => {
+        const ct = this.getResponseHeader("content-type") || "";
+        inspect(base, ct, () => this.responseType === "json" ? this.response : JSON.parse(this.responseText));
+      });
+    }
+    return oSend.call(this, body);
+  };
 
-  // Also catch invoices opened via window.open / link clicks
+  // Navigations / downloads
+  const nav = (u) => { if (u && /invoice|\.pdf/i.test(String(u))) logReq({ url: abs(String(u)), method: "GET", nav: true }); };
   const oWinOpen = window.open;
-  window.open = function (url, ...rest) {
-    if (url && /invoice/i.test(String(url))) send({ invoiceUrlSample: abs(String(url)) });
-    return oWinOpen.call(this, url, ...rest);
+  window.open = function (u, ...rest) { nav(u); return oWinOpen.call(this, u, ...rest); };
+  document.addEventListener("click", (e) => { const a = e.target?.closest?.("a[href]"); if (a) nav(a.href); }, true);
+  const oAClick = HTMLAnchorElement.prototype.click;
+  HTMLAnchorElement.prototype.click = function () { nav(this.href); return oAClick.call(this); };
+
+  // PDF generated inside the page itself (no server URL to reuse)
+  const oObj = URL.createObjectURL;
+  URL.createObjectURL = function (obj) {
+    if (obj && /pdf/i.test(obj.type || "")) logReq({ url: location.href, method: "GET", blobPdf: true });
+    return oObj.call(this, obj);
   };
 })();
