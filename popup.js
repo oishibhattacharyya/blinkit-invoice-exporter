@@ -1,12 +1,16 @@
 const $ = (id) => document.getElementById(id);
 const log = (m) => { $("log").textContent += m + "\n"; $("log").scrollTop = $("log").scrollHeight; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const jitter = () => 400 + Math.random() * 300;
+const jitter = () => 600 + Math.random() * 400;
 const withTimeout = (p, ms, label) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timed out`)), ms))]);
 const redact = (u) => { try { const x = new URL(u); return x.origin + x.pathname + (x.search ? "?" + [...x.searchParams.keys()].map((k) => k + "=…").join("&") : ""); } catch { return u; } };
+const bufToB64 = (buf) => { const b = new Uint8Array(buf); let s = ""; for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); };
+const isPdfBuf = (buf) => new TextDecoder().decode(buf.slice(0, 5)) === "%PDF-";
+const fileName = (o) => `${safe(o.date)}_${o.cartId}_${o.orderId}_Rs${safe(o.amount)}.pdf`;
 const PAGE_BASES = ["account"];   // https://blinkit.com/account/orders/{cartId}/{orderId}
 
 let orders = [], templates = [], goodBase = null, pendingT0 = 0, stopFlag = false, worker = null;
+let onlyIds = null;
 let extraLog = [], capturing = false;   // browser-level events (navigations/downloads) seen while learning
 let capture = { headers: {}, log: [] };
 
@@ -51,6 +55,7 @@ async function ensureWorker() {
   if (worker) { try { await chrome.tabs.get(worker.tabId); return worker; } catch { worker = null; } }
   const w = await chrome.windows.create({ url: "about:blank", focused: true, width: 1100, height: 800 });
   worker = { winId: w.id, tabId: w.tabs[0].id };
+  await navigate(worker.tabId, "https://blinkit.com/"); await sleep(1500);
   return worker;
 }
 // Blinkit's "Download invoice" sometimes opens the PDF in a new tab. We only need the request it
@@ -107,7 +112,7 @@ async function clickInvoiceInPage(waits) {
   }
   return { names, href: location.href };
 }
-async function fetchInPage(req, headers) {
+async function fetchInPage(req, headers, linkOnly) {
   const findLink = (o, d = 0) => {
     if (o == null || d > 6) return "";
     if (typeof o === "string") return /^https?:\/\/\S+/i.test(o) && /(\.pdf|invoice)/i.test(o) ? o : "";
@@ -135,6 +140,7 @@ async function fetchInPage(req, headers) {
       if (inline) return { base64: inline, size: Math.round(inline.length * 0.75) };
       const l = findLink(j);
       if (!l) return { error: "Server reply had no PDF in it" };
+      if (linkOnly) return { link: l };
       const r2 = await fetch(l);
       if (!r2.ok) return { error: `PDF link HTTP ${r2.status}`, status: r2.status };
       buf = await r2.arrayBuffer();
@@ -162,11 +168,17 @@ function pickRequest(t0, o) {
 }
 async function fetchPdf(tabId, t, o) {
   const req = fill(t, o);
-  const r = await withTimeout(inTab(tabId, fetchInPage, [req, capture.headers]), 60000, "download").catch((e) => ({ error: e.message }));
-  if (r.base64 || !/failed to fetch|networkerror|load failed/i.test(r.error || "")) return r;
-  // The page itself isn't allowed to read the file (cross-site). The extension is, so retry from here.
-  const r2 = await withTimeout(fetchInPage(req, capture.headers), 60000, "direct download").catch((e) => ({ error: e.message }));
-  return r2.base64 ? r2 : { ...r2, error: r2.error + " (also failed directly)" };
+  // Stage 1 — inside the Blinkit tab: ask Blinkit for this invoice (login + headers come along).
+  const r = await withTimeout(inTab(tabId, fetchInPage, [req, capture.headers, true]), 60000, "request").catch((e) => ({ error: e.message }));
+  if (r.base64 || !r.link) return r;
+  // Stage 2 — from the extension: fetch the PDF from its storage link (the page itself is often blocked from this).
+  try {
+    const res = await withTimeout(fetch(r.link), 60000, "file download");
+    if (!res.ok) return { link: r.link, status: res.status, error: `file HTTP ${res.status}` };
+    const buf = await res.arrayBuffer();
+    if (!isPdfBuf(buf)) return { link: r.link, error: "file wasn't a PDF" };
+    return { base64: bufToB64(buf), size: buf.byteLength };
+  } catch (e) { return { link: r.link, error: e.message }; }
 }
 
 // Work out a template from what the page just did, and prove it by downloading this order's PDF.
@@ -185,7 +197,8 @@ async function finishFromCapture(tabId, o, t0) {
   const t = toTemplate(req, o);
   if (!/\{(orderId|cartId)\}/.test(t.url + t.body)) { log("  The download doesn't contain the order ID, so it can't be repeated for other orders."); return { error: "request has no order id" }; }
   const r = await fetchPdf(tabId, t, o);
-  if (!r.base64) { log("  Test download failed: " + r.error); return { error: r.error }; }
+  if (!r.base64 && !r.link) { log("  Test download failed: " + r.error); return { error: r.error }; }
+  if (!r.base64) log("  Blinkit's request works, but the file couldn't be read directly; I'll fall back to Chrome downloads for those.");
   return { template: t, r };
 }
 async function waitForSignal(since, ms) {
@@ -198,7 +211,7 @@ async function waitForSignal(since, ms) {
   }
   return null;
 }
-async function learn(o) {
+async function learn(o, keep = false) {
   capturing = true;
   for (const base of goodBase ? [goodBase] : PAGE_BASES) {
     const t0 = Date.now(); pendingT0 = t0;
@@ -219,9 +232,10 @@ async function learn(o) {
     await sleep(3500);
     log("  Working out the download address…");
     const out = await finishFromCapture(tabId, o, t0);
-    if (out.template) capturing = false;
+    if (out.template || !keep) capturing = false;
     return out;
   }
+  if (!keep) capturing = false;
   return { error: "invoice button not found" };
 }
 
@@ -229,8 +243,8 @@ async function learn(o) {
 async function detect() {
   $("detectBtn").disabled = true; $("recheckBtn").style.display = "none";
   log("Finding the invoice link using your first order…");
-  const L = await learn(orders[0]);
-  if (L.template) { templates = [L.template]; log(`Found it. Test PDF OK (${Math.round(L.r.size / 1024)} KB). You can start Step 3.`); await closeWorker(); }
+  const L = await learn(orders[0], true);
+  if (L.template) { templates = [L.template]; log(L.r.base64 ? `Found it. Test PDF OK (${Math.round(L.r.size / 1024)} KB). You can start Step 3.` : "Found it (files will be saved via Chrome downloads if they can't go in the ZIP). You can start Step 3."); await closeWorker(); }
   else { log("Couldn't catch it automatically. In the Blinkit window that's open, click “Download invoice” yourself, then press ‘check again’."); $("recheckBtn").style.display = "block"; }
   await refresh();
 }
@@ -239,50 +253,62 @@ async function detect() {
 async function download(o) {
   await loadCapture();
   const w = await ensureWorker();
+  let last = { error: "no known format" };
   for (const t of [...templates]) {
     let r;
     for (let a = 0; a < 3; a++) {
       r = await fetchPdf(w.tabId, t, o);
-      if (r.base64 || ![429, 502, 503].includes(r.status)) break;
-      log("  Blinkit asked us to slow down, waiting…"); await sleep(3000 * (a + 1));
+      if (r.base64 || r.link || ![429, 502, 503].includes(r.status)) break;
+      log("  Blinkit asked us to slow down, waiting…"); await sleep(4000 * (a + 1));
     }
-    if (r.base64) { templates = [t, ...templates.filter((x) => x !== t)]; return r; }
-    if (r.status === 401 || r.status === 403) return r;
+    if (r.base64 || r.link) { templates = [t, ...templates.filter((x) => x !== t)]; return r; }
+    last = r;
+    if ([401, 403, 429].includes(r.status)) return r;
   }
-  log(`  Known formats didn't work for ${o.orderId} — learning this order's format from the page…`);
+  log(`  Known formats didn't work for ${o.orderId} (${last.error}) — learning from the page…`);
   const L = await learn(o);
-  if (L.template) { templates.unshift(L.template); log("  New format learned."); await refresh(); return L.r; }
+  if (L.template) {
+    if (!templates.some((x) => x.url === L.template.url && x.body === L.template.body && x.method === L.template.method)) templates.unshift(L.template);
+    log("  Learned a format for this order."); await refresh(); return L.r;
+  }
   return { error: L.error };
 }
 async function run() {
-  stopFlag = false; $("startBtn").disabled = true; $("stopBtn").style.display = "block";
-  const bar = $("progressBar"); bar.style.display = "block"; bar.max = orders.length; bar.value = 0;
-  const zip = new JSZip(), used = new Set(), failed = []; let ok = 0;
-  for (let i = 0; i < orders.length && !stopFlag; i++) {
-    const o = orders[i];
+  stopFlag = false; capturing = false; $("startBtn").disabled = true; $("stopBtn").style.display = "block";
+  const todo = onlyIds ? orders.filter((o) => onlyIds.has(o.orderId)) : orders;
+  const bar = $("progressBar"); bar.style.display = "block"; bar.max = todo.length; bar.value = 0;
+  const zip = new JSZip(), used = new Set(), failed = []; let ok = 0, viaDl = 0;
+  for (let i = 0; i < todo.length && !stopFlag; i++) {
+    const o = todo[i], tag = `[${i + 1}/${todo.length}]`;
     const r = await download(o);
+    let name = fileName(o);
+    while (used.has(name)) name = name.replace(".pdf", "_dup.pdf");
+    used.add(name);
     if (r.base64) {
-      let name = `${safe(o.date)}_${o.cartId}_${o.orderId}_Rs${safe(o.amount)}.pdf`;
-      while (used.has(name)) name = name.replace(".pdf", "_dup.pdf");
-      used.add(name); zip.file(name, r.base64, { base64: true }); ok++;
-      log(`[${i + 1}/${orders.length}] ${name}`);
+      zip.file(name, r.base64, { base64: true }); ok++; log(`${tag} ${name}`);
+    } else if (r.link) {
+      try {
+        await chrome.downloads.download({ url: r.link, filename: `blinkit_invoices_unzipped/${name}`, conflictAction: "uniquify" });
+        viaDl++; log(`${tag} ${name}  (saved by Chrome, outside the ZIP — see Downloads/blinkit_invoices_unzipped)`);
+      } catch (e) { failed.push(`${o.date}\t${o.orderId}\t${r.error}; ${e.message}`); log(`${tag} FAILED ${o.orderId}: ${r.error}`); }
     } else {
       failed.push(`${o.date}\t${o.orderId}\t${r.error}`);
-      log(`[${i + 1}/${orders.length}] FAILED ${o.orderId}: ${r.error}`);
+      log(`${tag} FAILED ${o.orderId}: ${r.error}`);
       if (r.status === 401 || r.status === 403) { log("Blinkit rejected the login. Log in again, redo Step 2, and retry."); break; }
     }
     bar.value = i + 1; await sleep(jitter());
   }
   await closeWorker(); $("stopBtn").style.display = "none";
   if (failed.length) zip.file("_failed_orders.txt", failed.join("\n"));
-  if (!ok) { log("No invoices could be downloaded."); $("startBtn").disabled = false; return; }
-  log(`\nZipping ${ok} PDFs…`);
-  const blob = await zip.generateAsync({ type: "blob", compression: "STORE" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `blinkit_invoices_${new Date().toISOString().slice(0, 10)}.zip`;
-  a.click();
-  log(`Done. ${ok} saved, ${failed.length} failed.${failed.length ? " (see _failed_orders.txt inside the zip)" : ""}`);
+  if (ok || failed.length) {
+    log(`\nZipping ${ok} PDFs…`);
+    const blob = await zip.generateAsync({ type: "blob", compression: "STORE" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `blinkit_invoices_${new Date().toISOString().slice(0, 10)}.zip`;
+    a.click();
+  }
+  log(`Done. ${ok} in the ZIP, ${viaDl} saved by Chrome separately, ${failed.length} failed.${failed.length ? " (see _failed_orders.txt inside the ZIP)" : ""}`);
   $("startBtn").disabled = false;
 }
 
@@ -291,6 +317,12 @@ $("jsonFile").addEventListener("change", async (e) => {
   const f = e.target.files[0]; if (!f) return;
   try { orders = parseOrders(JSON.parse(await f.text())); } catch (err) { return log("That file isn't valid JSON: " + err.message); }
   templates = []; $("orderCount").textContent = `${orders.length} deliverable orders loaded`; refresh();
+});
+$("failedFile").addEventListener("change", async (e) => {
+  const f = e.target.files[0]; if (!f) { onlyIds = null; $("onlyCount").textContent = ""; return; }
+  const ids = (await f.text()).split(/\r?\n/).map((l) => (l.split("\t")[1] || "").trim()).filter(Boolean);
+  onlyIds = ids.length ? new Set(ids) : null;
+  $("onlyCount").textContent = onlyIds ? `Will retry only ${onlyIds.size} orders from that list.` : "No order IDs found in that file.";
 });
 $("detectBtn").addEventListener("click", detect);
 $("recheckBtn").addEventListener("click", async () => {
