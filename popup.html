@@ -35,12 +35,6 @@
 </div>
 
 <div class="card">
-  <b>Optional:</b> retry only the failed ones — choose <code>_failed_orders.txt</code> from your previous ZIP
-  <input type="file" id="failedFile" accept=".txt" />
-  <div id="onlyCount" class="muted" style="margin-top:6px"></div>
-</div>
-
-<div class="card">
   <b>Step 2.</b> Let the extension learn how invoices are downloaded
   <div class="muted" style="margin:4px 0">It opens your first order and clicks “Download invoice” for you.</div>
   <button id="detectBtn" disabled>Find invoice link automatically</button>
@@ -59,6 +53,13 @@
 <div id="log"></div>
 <button id="diagBtn" class="secondary">Copy diagnostic info (share this if something fails)</button>
 <button id="clearBtn" class="secondary">Clear saved login data</button>
+
+<details class="card" style="margin-top:18px">
+  <summary>Advanced: retry only the failed orders</summary>
+  <div class="muted" style="margin:8px 0 4px">Choose <code>_failed_orders.txt</code> from a previous ZIP. Steps 1–3 then process only those orders.</div>
+  <input type="file" id="failedFile" accept=".txt" />
+  <div id="onlyCount" class="muted" style="margin-top:6px"></div>
+</details>
 
 <script src="jszip.min.js"></script>
 <script src="popup.js"></script>

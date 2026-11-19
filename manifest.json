@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Blinkit Bulk Invoice Zipper",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Bulk-downloads your own Blinkit order invoices into a single ZIP, using your logged-in session.",
   "permissions": [
     "storage",

@@ -10,19 +10,24 @@ const fileName = (o) => `${safe(o.date)}_${o.cartId}_${o.orderId}_Rs${safe(o.amo
 const PAGE_BASES = ["account"];   // https://blinkit.com/account/orders/{cartId}/{orderId}
 
 let orders = [], templates = [], goodBase = null, pendingT0 = 0, stopFlag = false, worker = null;
-let onlyIds = null;
+let onlyIds = null, skippedOrders = [], totalInFile = 0;
 let extraLog = [], capturing = false;   // browser-level events (navigations/downloads) seen while learning
 let capture = { headers: {}, log: [] };
 
 function parseOrders(raw) {
   const list = Array.isArray(raw) ? raw : raw.orders || raw.data?.orders || [];
-  return list.map((o) => {
+  const kept = [], skipped = [];
+  for (const o of list) {
     let cartId = o.cartId ?? o.cart_id ?? "", orderId = o.orderId ?? o.order_id ?? o.id ?? "";
     const link = o.detailDeepLink || "";
     const c = link.match(/[?&]cart_id=([^&]+)/), d = link.match(/[?&]order_id=([^&]+)/);
     if (c) cartId = c[1]; if (d) orderId = d[1];
-    return { orderId: String(orderId), cartId: String(cartId), date: String(o.date || "unknown-date"), amount: o.amount ?? 0, status: String(o.status || "") };
-  }).filter((o) => o.orderId && o.cartId && !/cancel/i.test(o.status));
+    const rec = { orderId: String(orderId), cartId: String(cartId), date: String(o.date || "unknown-date"), amount: o.amount ?? 0, status: String(o.status || "") };
+    if (!rec.orderId || !rec.cartId) skipped.push({ ...rec, why: "missing order or cart id" });
+    else if (/cancel/i.test(rec.status)) skipped.push({ ...rec, why: `status "${rec.status}"` });
+    else kept.push(rec);
+  }
+  return { kept, skipped, total: list.length };
 }
 const safe = (s) => String(s).replace(/[\\/:*?"<>|,]+/g, "").replace(/\s+/g, "-");
 
@@ -273,50 +278,112 @@ async function download(o) {
   }
   return { error: L.error };
 }
+// Runs inside the order page: grabs the lines that say what kind of order this is.
+async function readOrderPage() {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let text = "";
+  for (let i = 0; i < 24; i++) {
+    text = document.body ? document.body.innerText : "";
+    if (text.length > 200 && /order|deliver|cancel|arrived|₹/i.test(text)) break;
+    await sleep(500);
+  }
+  const lines = text.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  const re = /arrived|deliver|cancel|return|exchange|replac|refund|placed by|ordered by|order for|gift|on behalf|reject|fail|unable/i;
+  const hits = [...new Set(lines.filter((l) => l.length < 90 && re.test(l)))].slice(0, 6);
+  return { hits, hasArrived: /arrived/i.test(text), hasInvoice: /invoice/i.test(text), chars: text.length };
+}
+function classify(info) {
+  const said = info.hits.join(" | ");
+  let kind;
+  if (info.chars < 200) kind = "Order page is empty or didn't load (may be an order placed by someone else / not accessible from this account)";
+  else if (/cancel/i.test(said)) kind = "Cancelled order";
+  else if (/return/i.test(said)) kind = "Return order";
+  else if (/exchange|replac/i.test(said)) kind = "Exchange/replacement order";
+  else if (/placed by|ordered by|on behalf|order for|gift/i.test(said)) kind = "Placed by/for someone else";
+  else if (!info.hasArrived) kind = "Not a regular delivery (no “arrived” line on the page)";
+  else if (!info.hasInvoice) kind = "Regular delivered order, but the page offers no invoice";
+  else kind = "Regular order with an invoice option, but the invoice request failed";
+  return `${kind}. Page says: ${said || "(nothing matched)"}`;
+}
+async function whyFailed(o) {
+  try {
+    const tabId = await goto(`https://blinkit.com/${PAGE_BASES[0]}/orders/${o.cartId}/${o.orderId}`);
+    return classify(await withTimeout(inTab(tabId, readOrderPage, []), 40000, "reading the order page"));
+  } catch (e) { return `Couldn't read the order page (${e.message})`; }
+}
+async function sha(b64) {
+  const bin = atob(b64), u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-256", u))].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+const oneLine = (s) => String(s).replace(/[\t\r\n]+/g, " ");
+
 async function run() {
   stopFlag = false; capturing = false; $("startBtn").disabled = true; $("stopBtn").style.display = "block";
   const todo = onlyIds ? orders.filter((o) => onlyIds.has(o.orderId)) : orders;
+  const stamp = new Date().toISOString().slice(0, 10);
+  const folder = `blinkit_invoices_unzipped_${stamp}`;
   const bar = $("progressBar"); bar.style.display = "block"; bar.max = todo.length; bar.value = 0;
-  const zip = new JSZip(), used = new Set(), failed = []; let ok = 0, viaDl = 0;
+  const zip = new JSZip(), used = new Set(), hashes = new Map(), dups = [], failed = [];
+  let ok = 0, viaDl = 0;
   for (let i = 0; i < todo.length && !stopFlag; i++) {
     const o = todo[i], tag = `[${i + 1}/${todo.length}]`;
     const r = await download(o);
     let name = fileName(o);
     while (used.has(name)) name = name.replace(".pdf", "_dup.pdf");
     used.add(name);
+    const fail = async (technical, skipWhy) => {
+      const why = skipWhy || await whyFailed(o);
+      failed.push(`${o.date}\t${o.orderId}\t${oneLine(why)} [technical: ${oneLine(technical)}]`);
+      log(`${tag} FAILED ${o.orderId}: ${why}`);
+    };
     if (r.base64) {
       zip.file(name, r.base64, { base64: true }); ok++; log(`${tag} ${name}`);
+      const h = await sha(r.base64);
+      if (hashes.has(h)) { dups.push(`${name}  ==  ${hashes.get(h)}`); log(`   (identical PDF to ${hashes.get(h)})`); } else hashes.set(h, name);
     } else if (r.link) {
       try {
-        await chrome.downloads.download({ url: r.link, filename: `blinkit_invoices_unzipped/${name}`, conflictAction: "uniquify" });
-        viaDl++; log(`${tag} ${name}  (saved by Chrome, outside the ZIP — see Downloads/blinkit_invoices_unzipped)`);
-      } catch (e) { failed.push(`${o.date}\t${o.orderId}\t${r.error}; ${e.message}`); log(`${tag} FAILED ${o.orderId}: ${r.error}`); }
-    } else {
-      failed.push(`${o.date}\t${o.orderId}\t${r.error}`);
-      log(`${tag} FAILED ${o.orderId}: ${r.error}`);
-      if (r.status === 401 || r.status === 403) { log("Blinkit rejected the login. Log in again, redo Step 2, and retry."); break; }
-    }
+        await chrome.downloads.download({ url: r.link, filename: `${folder}/${name}`, conflictAction: "uniquify" });
+        viaDl++; log(`${tag} ${name}  (saved by Chrome, outside the ZIP — see Downloads/${folder})`);
+      } catch (e) { await fail(`${r.error}; ${e.message}`); }
+    } else if (r.status === 401 || r.status === 403) {
+      await fail(r.error, "Blinkit rejected the login — log in again, redo Step 2, and retry.");
+      log("Stopping: log in to Blinkit again first."); break;
+    } else if (r.status === 429) {
+      await fail(r.error, "Blinkit rate-limited this request — just retry it later.");
+    } else await fail(r.error);
     bar.value = i + 1; await sleep(jitter());
   }
   await closeWorker(); $("stopBtn").style.display = "none";
   if (failed.length) zip.file("_failed_orders.txt", failed.join("\n"));
+  zip.file("_summary.txt", [
+    `Orders in your file: ${totalInFile}`,
+    `Skipped when loading (${skippedOrders.length}):`, ...skippedOrders.map((k) => `  ${k.date}  ${k.orderId || "(no id)"}  ${k.why}`),
+    `Processed this run: ${todo.length}${onlyIds ? " (retry list)" : ""}`,
+    `In this ZIP: ${ok}   Saved by Chrome separately: ${viaDl}   Failed: ${failed.length}`,
+    `Identical PDFs under different orders (${dups.length}):`, ...dups.map((d) => "  " + d)
+  ].join("\n"));
   if (ok || failed.length) {
     log(`\nZipping ${ok} PDFs…`);
     const blob = await zip.generateAsync({ type: "blob", compression: "STORE" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `blinkit_invoices_${new Date().toISOString().slice(0, 10)}.zip`;
+    a.download = `blinkit_invoices_${stamp}.zip`;
     a.click();
   }
-  log(`Done. ${ok} in the ZIP, ${viaDl} saved by Chrome separately, ${failed.length} failed.${failed.length ? " (see _failed_orders.txt inside the ZIP)" : ""}`);
+  log(`Done. ${ok} in the ZIP, ${viaDl} saved by Chrome separately, ${failed.length} failed.${failed.length ? " Reasons are in _failed_orders.txt inside the ZIP." : ""}`);
   $("startBtn").disabled = false;
 }
 
 // ---------- wiring ----------
 $("jsonFile").addEventListener("change", async (e) => {
   const f = e.target.files[0]; if (!f) return;
-  try { orders = parseOrders(JSON.parse(await f.text())); } catch (err) { return log("That file isn't valid JSON: " + err.message); }
-  templates = []; $("orderCount").textContent = `${orders.length} deliverable orders loaded`; refresh();
+  try { const p = parseOrders(JSON.parse(await f.text())); orders = p.kept; skippedOrders = p.skipped; totalInFile = p.total; }
+  catch (err) { return log("That file isn't valid JSON: " + err.message); }
+  templates = [];
+  $("orderCount").textContent = `${orders.length} orders will be processed (${totalInFile} in file, ${skippedOrders.length} skipped)`;
+  for (const k of skippedOrders.slice(0, 40)) log(`Skipped ${k.date} ${k.orderId || "(no id)"}: ${k.why}`);
+  refresh();
 });
 $("failedFile").addEventListener("change", async (e) => {
   const f = e.target.files[0]; if (!f) { onlyIds = null; $("onlyCount").textContent = ""; return; }
